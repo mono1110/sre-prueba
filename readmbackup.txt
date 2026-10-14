@@ -1,0 +1,360 @@
+# Servicio de procesamiento serverless en AWS (Terraform)
+
+Prueba técnica de Ingeniero SRE: **VPC · API Gateway (HTTP API) · Lambda (Python) · ElastiCache Redis · S3**, definida íntegramente con Terraform y desplegable con un único `terraform apply`.
+
+> **Estado de validación:** este repositorio fue revisado de forma estática y la lógica de Lambda y el script de empaquetado se probaron localmente (tests unitarios con dobles). **No se ha ejecutado `terraform apply` ni se ha validado el despliegue real en AWS.** La evidencia de la carpeta `evidence/` debes generarla tú al desplegar (ver [Pruebas](#11-pruebas-con-curl)).
+
+## Índice
+
+1. [Objetivo y resumen](#1-objetivo-y-resumen)
+2. [Arquitectura](#2-arquitectura)
+3. [Red: VPC y subnets](#3-red-vpc-y-subnets)
+4. [Flujo de una solicitud](#4-flujo-de-una-solicitud)
+5. [IGW, NAT Gateway y Gateway Endpoint de S3](#5-igw-nat-gateway-y-gateway-endpoint-de-s3)
+6. [Seguridad: Security Groups, IAM y S3](#6-seguridad-security-groups-iam-y-s3)
+7. [HTTP API vs REST API](#7-http-api-vs-rest-api)
+8. [Decisiones económicas, límites y mejoras para producción](#8-decisiones-económicas-límites-y-mejoras-para-producción)
+9. [Requisitos locales](#9-requisitos-locales)
+10. [Despliegue](#10-despliegue)
+11. [Pruebas con curl](#11-pruebas-con-curl)
+12. [Resultados esperados](#12-resultados-esperados)
+13. [Inspeccionar S3](#13-inspeccionar-el-objeto-en-s3)
+14. [Logs en CloudWatch](#14-logs-en-cloudwatch)
+15. [Destruir la infraestructura](#15-destruir-la-infraestructura)
+16. [Manejo de errores](#16-manejo-de-errores)
+17. [Estructura del repositorio](#17-estructura-del-repositorio)
+
+---
+
+## 1. Objetivo y resumen
+
+El servicio recibe `POST /process` con un JSON, lo procesa en una Lambda dentro de una VPC y aplica **cache-aside** con Redis:
+
+- **MISS**: procesa → guarda `results/<YYYY-MM-DD>/<id>.json` en S3 → escribe en Redis con **TTL de 60 s** → responde con `X-Cache: MISS`.
+- **HIT**: devuelve el resultado cacheado sin reprocesar ni escribir en S3 → `X-Cache: HIT`.
+
+Puntos clave: Lambda y Redis en la **misma AZ (A)**; tráfico a S3 por **Gateway Endpoint** (no sale a Internet); Redis **privado, con TLS y cifrado en reposo**, accesible solo desde el SG de Lambda; bucket S3 privado, versionado y cifrado; empaquetado de dependencias automatizado dentro de Terraform.
+
+### Diferencias deliberadas respecto al diagrama de referencia
+
+| Diagrama original | Esta implementación | Motivo |
+|---|---|---|
+| Flecha API Gateway ↔ Internet Gateway | **No existe** | HTTP API es un servicio regional gestionado: invoca Lambda por su integración, no atraviesa el IGW. |
+| Redis en la subnet `10.0.12.0/24` (AZ B) | Redis en AZ A (`10.0.11.0/24`) | Requisito: Lambda y Redis en la misma AZ. La subnet `10.0.12.0/24` existe, está en el subnet group y tiene rutas, pero sin cargas. |
+| NAT Gateway conectado a Lambda en el flujo de petición | NAT solo para **salida** de la VPC | El NAT no forma parte del camino API Gateway → Lambda. |
+
+## 2. Arquitectura
+
+```mermaid
+flowchart LR
+  client([Cliente HTTP]) -->|"HTTPS · POST /process"| apigw["API Gateway<br/>HTTP API"]
+  apigw -->|"Integración proxy<br/>payload 2.0"| lambda
+
+  subgraph vpc["VPC 10.0.0.0/16"]
+    igw["Internet Gateway"]
+    s3gw{{"Gateway Endpoint S3"}}
+
+    subgraph az_a["Availability Zone A"]
+      subgraph pub_a["Subnet pública A · 10.0.1.0/24"]
+        nat["NAT Gateway + EIP"]
+      end
+      subgraph priv_a["Subnet privada A · 10.0.11.0/24"]
+        lambda["Lambda process_handler"]
+        redis[("ElastiCache Redis<br/>cache.t3.micro · 1 nodo")]
+      end
+    end
+
+    subgraph az_b["Availability Zone B"]
+      pub_b["Subnet pública B · 10.0.2.0/24<br/>(sin cargas)"]
+      priv_b["Subnet privada B · 10.0.12.0/24<br/>(sin cargas)"]
+    end
+  end
+
+  lambda -->|"TCP 6379 (TLS)"| redis
+  lambda -->|"HTTPS 443"| s3gw --> s3[("S3<br/>results/fecha/id.json")]
+  lambda -.->|"salida 443 opcional"| nat --> igw --> internet((Internet))
+```
+
+Servicios adicionales y por qué se incluyen: **CloudWatch Logs** (logs de Lambda y access logs de API Gateway, requisito de la prueba) e **IAM** (rol de mínimo privilegio). No se usan Secrets Manager ni Parameter Store porque el diseño **no tiene secretos** (ver [mejoras](#8-decisiones-económicas-límites-y-mejoras-para-producción)).
+
+## 3. Red: VPC y subnets
+
+La VPC `10.0.0.0/16` (65 536 direcciones) se divide en cuatro `/24` sin solapamiento: dos públicas (`10.0.1.0/24`, `10.0.2.0/24`) y dos privadas (`10.0.11.0/24`, `10.0.12.0/24`). Las AZ se obtienen con `data.aws_availability_zones` (las dos primeras disponibles) y se reutilizan en todos los recursos mediante `local.azs`.
+
+| Recurso | AZ | Subnet | CIDR |
+|---|---|---|---|
+| NAT Gateway + Elastic IP | A | Pública A | `10.0.1.0/24` |
+| Subnet pública B | B | Pública B | `10.0.2.0/24` (sin cargas) |
+| Lambda (ENI de VPC) | A | Privada A | `10.0.11.0/24` |
+| Redis (nodo único) | A | Privada A | `10.0.11.0/24` |
+| Subnet privada B | B | Privada B | `10.0.12.0/24` (en el subnet group de Redis; sin cargas) |
+| Internet Gateway, Gateway Endpoint S3 | — | A nivel de VPC / tablas de rutas | — |
+| API Gateway, S3, CloudWatch | — | Servicios regionales (fuera de la VPC) | — |
+
+Tablas de rutas: una pública por subnet pública (`0.0.0.0/0 → IGW`) y una privada por subnet privada (`0.0.0.0/0 → NAT Gateway` + ruta al endpoint de S3 por prefix list).
+
+## 4. Flujo de una solicitud
+
+1. El cliente envía `POST /process` a la HTTP API (HTTPS público).
+2. API Gateway aplica CORS y throttling del stage e invoca Lambda por integración proxy (payload 2.0). Escribe un access log JSON.
+3. Lambda (ENI en `10.0.11.0/24`) valida el JSON, calcula `SHA-256` del JSON canónico (claves ordenadas) como clave de caché y consulta Redis por TLS.
+4. **HIT** → responde con el valor cacheado. **MISS** → procesa, `PutObject` en S3 (vía Gateway Endpoint), `SET … EX 60` en Redis y responde.
+
+Ejemplo de transformación (determinista y fácil de explicar): se invierten los *strings* de primer nivel y se añaden metadatos (`request_sha256`, `processed_at`, `s3_key`).
+
+El identificador de resultado es el campo `id` del cliente (validado con `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, porque forma parte de la clave de S3) o, si falta, los 32 primeros caracteres del hash del contenido.
+
+## 5. IGW, NAT Gateway y Gateway Endpoint de S3
+
+- **Internet Gateway**: da salida/entrada a Internet a las subnets públicas. Aquí solo lo usa el NAT Gateway; **nada llega a Lambda a través del IGW**.
+- **NAT Gateway (uno, en la subnet pública A)**: permite salida a Internet (solo conexiones iniciadas desde dentro) a recursos privados. La función actual no lo necesita para Redis ni S3; está por requisito y permite futuras llamadas a APIs externas.
+- **Gateway Endpoint de S3**: añade rutas a las tablas privadas por *prefix list*. El tráfico a S3 viaja por la red de AWS, sin NAT ni Internet, y sin costo por hora ni por GB. Su **política** solo permite `s3:PutObject` sobre `results/*` de este bucket.
+
+## 6. Seguridad: Security Groups, IAM y S3
+
+**Security Groups** (mínimo privilegio; Terraform elimina la regla "allow all" de salida por defecto):
+
+| SG | Entrada | Salida |
+|---|---|---|
+| `lambda-sg` | Ninguna | TCP 6379 → `redis-sg` · TCP 443 → prefix list de S3 · TCP 443 → `0.0.0.0/0` (*opcional*, vía NAT) |
+| `redis-sg` | TCP 6379 **solo** desde `lambda-sg` | Ninguna |
+| SG `default` de la VPC | Vaciado (sin reglas) | Vaciado |
+
+La salida `443 → 0.0.0.0/0` es la única regla amplia: sirve para llamadas HTTPS a servicios externos a través del NAT. Se puede quitar con `lambda_allow_internet_https_egress = false` (la función actual funciona igual).
+
+**IAM** (rol exclusivo de Lambda, con confianza únicamente en `lambda.amazonaws.com`):
+
+1. Política administrada `AWSLambdaENIManagementAccess`: solo gestión de ENI para acceso a VPC.
+2. Política propia de logs: `CreateLogStream`/`PutLogEvents` **solo** en su log group.
+3. Política propia de S3: `s3:PutObject` **solo** sobre `results/*` del bucket.
+
+**S3**: Block Public Access (4/4), versionado, cifrado SSE-S3 (AES256), ACL desactivadas (`BucketOwnerEnforced`), expiración de versiones antiguas a 30 días. **Bucket policy**: `Deny` de transporte no TLS; `Allow` de `PutObject` en `results/*` **solo al rol de Lambda y solo desde el Gateway Endpoint** (`aws:SourceVpce`); `Deny` al rol de Lambda si llega por otra vía. La opción `s3_admin_principal_arns` añade un `Deny` a *cualquier otro principal* (desactivada por defecto para no bloquear a Terraform).
+
+**Redis**: sin acceso público (ElastiCache no tiene IP pública), TLS en tránsito y cifrado en reposo. Se usa `aws_elasticache_replication_group` con **un solo nodo y sin failover** en lugar de `aws_elasticache_cluster` porque este último **no permite activar cifrado**. No se configura `AUTH`: el acceso se restringe por red (SG) y no hay credenciales que gestionar; ver mejoras.
+
+## 7. HTTP API vs REST API
+
+Se eligió **HTTP API** porque: es más barata (~70 % menos por millón de peticiones), tiene menor latencia, ofrece CORS nativo y throttling por stage, `auto_deploy` sin recursos de *deployment*, access logs JSON y la integración proxy 2.0 con Lambda es sencilla. Se renuncia a funciones de REST API que esta prueba no necesita: API keys/usage plans, validación de modelos de petición, caché del gateway, integración con WAF y claves de cliente. Si se requirieran (p. ej., WAF o planes de uso por cliente), habría que migrar a REST API.
+
+**Valores de throttling** (stage): `rate = 50 req/s`, `burst = 100` (`api_throttling_rate_limit`, `api_throttling_burst_limit`). Son conservadores para la prueba y protegen a Redis/Lambda de un abuso accidental.
+
+## 8. Decisiones económicas, límites y mejoras para producción
+
+**Elecciones económicas y su coste en disponibilidad**
+
+- **Un solo NAT Gateway** (AZ A): ahorra el coste de un segundo NAT, pero la salida a Internet de ambas subnets privadas depende de la AZ A.
+- **Redis de un nodo, sin réplica, en AZ A**: cumple el requisito de co-ubicación con Lambda y evita costes, **sacrificando redundancia**: si falla el nodo o la AZ A, la caché no está disponible y el servicio devuelve 500 (la caché es parte del camino crítico por diseño de la prueba).
+- **Lambda solo en la subnet privada A**: misma razón. La subnet B existe pero no se usa.
+- **HTTP API**, **SSE-S3** (sin KMS), **snapshots de Redis desactivados** (las claves son efímeras).
+
+**Costes (orden de magnitud; verifica la tarifa vigente en la calculadora de AWS; este despliegue NO es gratuito)**
+
+| Recurso | Cobro | Comentario |
+|---|---|---|
+| NAT Gateway | Por hora + por GB procesado | Normalmente el mayor coste fijo del stack (decenas de USD/mes si se deja encendido). |
+| ElastiCache `cache.t3.micro` | Por hora de nodo | Coste fijo mientras exista (≈ unas decenas de USD/mes como máximo). |
+| Elastic IP / IPv4 pública | Por hora | AWS cobra las IPv4 públicas, incluso asociadas al NAT. |
+| API Gateway HTTP API, Lambda | Por petición / duración | Despreciable para pruebas. |
+| CloudWatch Logs, S3 | Ingesta/almacenamiento | Despreciable para pruebas. |
+| Gateway Endpoint S3 | Sin cargo | — |
+
+**Recomendación**: despliega, prueba y ejecuta `terraform destroy` en la misma sesión.
+
+**Mejoras para producción**: NAT por AZ; Redis con réplica y Multi-AZ con failover; Lambda en ambas subnets privadas; `AUTH`/RBAC de ElastiCache con credenciales en Secrets Manager (y VPC endpoint o NAT para consultarlo) o autenticación IAM; KMS gestionado por el cliente (S3, Redis, CloudWatch); autorización en la API (JWT/IAM) o REST API + WAF; alarmas (errores 5xx, latencia, evictions, CPU de Redis); X-Ray; *reserved concurrency*; endpoints de interfaz para CloudWatch Logs si se elimina el NAT; backend remoto (S3 + bloqueo) y CI con `tflint`/`checkov`; protección contra *cache stampede* (bloqueo con `SET NX`); `s3_force_destroy = false`.
+
+**Limitaciones conocidas**: el `id` lo elige el cliente: dos cuerpos distintos con el mismo `id` y fecha sobrescriben el mismo objeto (queda como nueva versión en S3). Si Redis falla tras guardar en S3, se responde 500 aunque el objeto exista. El empaquetado requiere Python y acceso a PyPI en la máquina que ejecuta Terraform.
+
+## 9. Requisitos locales
+
+| Herramienta | Versión | Uso |
+|---|---|---|
+| Terraform | ≥ 1.5 | IaC |
+| AWS CLI | v2 | Verificaciones (`s3`, `logs`) |
+| Python | ≥ 3.9 (en PATH) | Empaquetado de la Lambda (solo biblioteca estándar) |
+| pip | reciente | Descarga de `redis` (acceso a PyPI) |
+| curl, bash | — | Pruebas (en Windows: WSL o Git Bash) |
+
+- Credenciales AWS válidas (`aws configure`, perfil o SSO) en la región objetivo. **No se requiere `AdministratorAccess`**; basta un permiso que cubra: EC2/VPC (subnets, rutas, NAT, EIP, endpoints, SG), ElastiCache, Lambda, API Gateway v2, S3, IAM (roles y políticas con prefijo del proyecto) y CloudWatch Logs (incluidas `logs:PutResourcePolicy` y `logs:DescribeResourcePolicies` para la entrega de access logs).
+- En Windows, define `python_executable = "python"` en `terraform.tfvars`.
+
+## 10. Despliegue
+
+```bash
+# 1) Opcional: personaliza variables
+cp terraform.tfvars.example terraform.tfvars
+
+# 2) Inicializar (descarga proveedores y genera .terraform.lock.hcl; versiona ese archivo)
+terraform init
+
+# 3) Validar y revisar el plan (el plan ya empaqueta la Lambda automáticamente)
+terraform validate
+terraform plan -out tfplan
+
+# 4) Desplegar (ElastiCache tarda ~10-15 min en crearse)
+terraform apply tfplan
+
+# 5) Ver los outputs
+terraform output
+```
+
+**Empaquetado automático**: `data "external"` ejecuta `scripts/package_lambda.py`, que instala `redis` (wheels para el runtime/arquitectura de Lambda), copia `lambda/*.py` y genera un ZIP **determinista** en `build/`. Devuelve el SHA-256 real del ZIP, que se usa como `source_code_hash`: cambia si cambian `handler.py`, `requirements.txt`, el script, el runtime o la arquitectura. Es idempotente (no reconstruye si nada cambió). Se evalúa **antes** de planificar, por eso un checkout limpio funciona con un único `terraform apply`; `terraform destroy` reutiliza `build/` y no necesita red si ya existe.
+
+Pruebas unitarias del handler (sin AWS): `python -m unittest discover -s tests -v`.
+
+## 11. Pruebas con curl
+
+```bash
+export API_URL="$(terraform output -raw process_url)"
+export BUCKET="$(terraform output -raw results_bucket_name)"
+export AWS_REGION="$(terraform output -raw aws_region)"
+```
+
+**Prueba A: MISS**
+
+```bash
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' \
+  -d '{"id":"demo-001","message":"hola mundo","n":42}'
+```
+
+**Prueba B: HIT** (dentro de 60 s; mismas propiedades en otro orden → misma clave de caché)
+
+```bash
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' \
+  -d '{"n":42,"message":"hola mundo","id":"demo-001"}'
+```
+
+**Prueba C: expiración**
+
+```bash
+sleep 61
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' \
+  -d '{"id":"demo-001","message":"hola mundo","n":42}'
+```
+
+**Prueba D: errores controlados**
+
+```bash
+# D1: JSON inválido -> 400
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' -d '{"id": '
+
+# D2: id peligroso -> 400
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' -d '{"id":"../etc/passwd"}'
+
+# D3: simular caída de Redis (nombre de host inexistente) -> 500 cache_unavailable
+terraform apply -auto-approve -var 'lambda_environment_overrides={REDIS_HOST="redis-inexistente.invalid"}'
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' -d '{"id":"d3","m":"x"}'
+
+# D4: simular fallo de S3 (bucket no permitido por las políticas) -> 500 storage_write_failed
+terraform apply -auto-approve -var 'lambda_environment_overrides={RESULTS_BUCKET="bucket-no-autorizado-xyz"}'
+curl -i -sS -X POST "$API_URL" -H 'Content-Type: application/json' -d '{"id":"d4","m":"x"}'
+
+# Restaurar la configuración normal
+terraform apply -auto-approve
+```
+
+**Todo automatizado** (A, B, C, D1, D2 + evidencia en `evidence/`):
+
+```bash
+./scripts/smoke_test.sh            # SKIP_EXPIRY=1 para omitir la espera de la Prueba C
+```
+
+## 12. Resultados esperados
+
+*(Ejemplos ilustrativos: los valores `processed_at`, `request_sha256` y los TTL variarán.)*
+
+**Primera solicitud (MISS)**
+
+```text
+HTTP/2 200
+content-type: application/json; charset=utf-8
+x-cache: MISS
+x-cache-ttl: 60
+
+{"id":"demo-001","output":{"reversed_strings":{"message":"odnum aloh"},"top_level_fields":3},"processed_at":"2026-10-13T15:04:05Z","request_sha256":"<64 hex>","s3_key":"results/2026-10-13/demo-001.json"}
+```
+
+**Segunda solicitud idéntica (HIT)**: mismo cuerpo, y `x-cache: HIT` con `x-cache-ttl` decreciente (p. ej. `41`), que es el TTL restante de la clave en Redis.
+
+**Tras 61 s**: `x-cache: MISS` otra vez, con un nuevo `processed_at`.
+
+**JSON inválido**
+
+```text
+HTTP/2 400
+{"error":"invalid_json","message":"El cuerpo de la solicitud no es un JSON válido.","requestId":"<id>"}
+```
+
+**Redis caído**: `500` con `{"error":"cache_unavailable",...}`. **Fallo de S3**: `500` con `{"error":"storage_write_failed",...}` y `x-cache: MISS`.
+
+Las respuestas de error no incluyen trazas, hosts ni credenciales; el detalle está en CloudWatch, correlacionable por `requestId`.
+
+## 13. Inspeccionar el objeto en S3
+
+```bash
+TODAY="$(date -u +%F)"
+aws s3 ls "s3://$BUCKET/results/$TODAY/" --region "$AWS_REGION"
+aws s3 cp "s3://$BUCKET/results/$TODAY/demo-001.json" - --region "$AWS_REGION"
+aws s3api list-object-versions --bucket "$BUCKET" --prefix "results/$TODAY/demo-001.json" --region "$AWS_REGION"
+```
+
+Tras la Prueba C verás **dos versiones** del mismo objeto (versionado habilitado). Estos comandos los ejecuta tu identidad de AWS CLI, no el rol de Lambda.
+
+**Comprobar el TTL en Redis**: Redis solo es alcanzable desde la VPC, por eso la Lambda devuelve `X-Cache-TTL` (60 en MISS; el TTL restante real, consultado a Redis, en HIT). Cada clave se escribe con `SET … EX`, por lo que nunca queda sin expiración.
+
+## 14. Logs en CloudWatch
+
+```bash
+# Logs de ejecución de la Lambda (JSON)
+aws logs tail "$(terraform output -raw lambda_log_group_name)" --since 15m --follow --region "$AWS_REGION"
+
+# Solo errores
+aws logs filter-log-events --log-group-name "$(terraform output -raw lambda_log_group_name)" \
+  --filter-pattern '"ERROR"' --region "$AWS_REGION"
+
+# Access logs de API Gateway (distintos de los de Lambda)
+aws logs tail "$(terraform output -raw api_access_log_group_name)" --since 15m --region "$AWS_REGION"
+```
+
+Los access logs incluyen `requestId`, `routeKey`, `path`, `status`, latencias, `integrationStatus` y mensajes de error de integración. Los logs de Lambda **no** contienen el cuerpo de la solicitud ni secretos; solo prefijo del hash de la clave, estado de caché y códigos de error.
+
+## 15. Destruir la infraestructura
+
+```bash
+terraform destroy
+```
+
+- `s3_force_destroy = true` (predeterminado) vacía el bucket, incluidas todas las versiones.
+- La eliminación de subnets/SG puede tardar unos minutos mientras AWS libera las ENI de Lambda; si falla por dependencias, reintenta `terraform destroy`.
+- Comprueba en la consola de facturación que no queden NAT Gateway, EIP ni nodos ElastiCache.
+
+## 16. Manejo de errores
+
+| Situación | HTTP | `error` | Notas |
+|---|---|---|---|
+| Cuerpo vacío / JSON inválido / no es objeto / `id` inválido | 400 | `empty_body`, `invalid_json`, `invalid_body_type`, `invalid_id`, `invalid_body_encoding` | Rechazado antes de tocar Redis o S3. |
+| Cuerpo > 256 KB | 413 | `payload_too_large` | |
+| Redis no responde (lectura) | 500 | `cache_unavailable` | No se degrada en silencio: la caché es parte del flujo. |
+| Falla `PutObject` en S3 | 500 | `storage_write_failed` | **No se cachea** ni se responde éxito; `X-Cache: MISS`. |
+| Falla la escritura en Redis tras guardar en S3 | 500 | `cache_write_failed` | El mensaje indica que el objeto sí quedó en S3. |
+| Excepción no prevista | 500 | `internal_error` | Red de seguridad: nunca se filtra un 502 de API Gateway. |
+
+La prueba pide HTTP 500 para excepciones: las fallas de dependencias se devuelven como 500 con un código `error` distinto para poder diferenciarlas (alternativa válida: 502/503). `X-Cache` está en todas las respuestas 2xx y en los errores posteriores a un MISS.
+
+## 17. Estructura del repositorio
+
+```text
+.
+├── versions.tf  providers.tf  locals.tf  variables.tf
+├── network.tf  security.tf  s3.tf  iam.tf  redis.tf  lambda.tf  api_gateway.tf  outputs.tf
+├── terraform.tfvars.example
+├── lambda/
+│   ├── handler.py            # función process_handler
+│   └── requirements.txt      # redis==5.2.1 (se empaqueta dentro del ZIP)
+├── scripts/
+│   ├── package_lambda.py     # empaquetado determinista (invocado por Terraform)
+│   └── smoke_test.sh         # pruebas A-D + generación de evidencia
+├── tests/test_handler.py     # pruebas unitarias del handler
+├── evidence/                 # evidencia generada tras el despliegue
+├── README.md
+└── .gitignore
+```

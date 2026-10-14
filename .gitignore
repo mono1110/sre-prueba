@@ -1,0 +1,37 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfplan
+tfplan
+# Se recomienda VERSIONAR .terraform.lock.hcl (no se ignora)
+
+# Artefactos de empaquetado de la Lambda (los genera Terraform)
+build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Editor / SO
+.idea/
+.vscode/
+.DS_Store
+
+# Archivos locales de planes Terraform
+terraform-plan-full.txt
+terraform-plan.txt
+
+# Plantilla de variables Terraform (si tampoco quieres publicarla)
+terraform.tfvars.example
