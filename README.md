@@ -1,5 +1,6 @@
-Diagrama de arquitectura:
-El diagrama se encuentra en el archivo: Arquitectura.png
+## Arquitectura
+
+![Diagrama de arquitectura AWS](Arquitectura.png)
 
 ## 1. Prerrequisitos
 
